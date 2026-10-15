@@ -1,130 +1,215 @@
-// Facet — the game. This is the file the build implements.
-//
-// `src/main.ts`, `src/constants.ts` and the project's configuration are supplied
-// with the project and stay as they are. What is missing is the game: the state
-// it holds, the debug surface that poses and reads that state, and the three
-// functions below.
-//
-// First, declare and export `FacetState`, exactly as `specs/state.md` fixes it,
-// and `FacetDebugApi`, the debug and automation surface
-// `specs/instrumentation.md` specifies. The stub below is written against both
-// names, so this project does not compile until they exist. The type check
-// failing on a freshly seeded workspace is the starting point, not a broken
-// seed.
-//
-// Then implement the three functions. `initialize` runs once, when the engine is
-// initialized, and returns the state and the debug surface together, as the pair
-// `[state, debug]`. `update` and `render` then run once each per frame, `update`
-// first, with the frame's delta time in seconds, then `render`.
-//
-// The state is a value, and every frame is a transition over it. The engine
-// hands `update` the current state as a read-only view
-// (`DeepReadonly<FacetState>`, from `ts-essentials`) and stores whatever
-// `update` returns as the next state; `render` is handed that next state, as the
-// same read-only view, and returns nothing. Nothing ever holds a writable
-// `FacetState`: `update` builds the next state from the current one rather than
-// assigning into it, and a frame that returns `undefined` is refused by the
-// engine. The engine's own
-// documentation, seeded at `engine/`, defines all of this and the scoped APIs
-// each function receives; read it before you start.
-//
-// The engine returns the surface from `engine.debug`, exactly as `initialize`
-// handed it over, which is how the game is driven from code
-// (`specs/instrumentation.md`). Because no one holds a writable state, the
-// surface is written in the shape of `update`: a pose takes the current state
-// and returns the next (`loadBoard(state, rows)`, `requestSwap(state, colA,
-// rowA, colB, rowB)`), a reading takes the state and returns what it read
-// (`snapshot(state)`), and a caller drives them through `engine.apply` and
-// `engine.state`. Where its implementation lives under `src/` is your call; the
-// only fixed point is that `initialize` returns it.
-//
-// The pointer comes from the engine as well, and it is what the whole game is
-// worked with: a gem is taken hold of by pressing on it, offered onto its
-// neighbor by pressing or dragging there, and the move is played by the release.
-// Every screen carries pointer targets besides, so a player with nothing but a
-// touchscreen reaches all of them. The engine hands `update` the pointer's
-// position already in logical stage units, along with its press and release
-// edges and the device that drove it. The engine's input documentation, seeded
-// at `engine/`, defines the API, and `specs/controls.md` states what Facet does
-// with them.
-//
-// The sprites, effects, and sounds are produced, not supplied.
-// `specs/assets.md` states what you produce with the asset tools and commit
-// under `public/assets/`; the images and the cues are loaded through the
-// engine's own asset and audio APIs, which its documentation defines.
-
-import type {
-  Game,
-  InitApi,
-  RenderApi,
-  UpdateApi,
-} from "@clockwyrks/simple-2d";
+import type { Game } from "@clockwyrks/simple-2d";
 import type { DeepReadonly } from "ts-essentials";
+import * as C from "./constants";
 
-/**
- * The stage background, a CSS color string. `src/main.ts` hands it to the engine
- * as the color the canvas is cleared to each frame, so the letterbox bars around
- * the stage match the board's surround. This placeholder is replaced by the
- * build with the color its board sits on.
- */
-export const BACKGROUND = "#000";
+export type GemKind =
+  "ruby" | "amber" | "citrine" | "jade" | "beryl" | "sapphire" | "amethyst";
 
-const NOT_IMPLEMENTED = "Facet: src/game.ts is not implemented yet";
+export type Cut = "plain" | "brilliant" | "star" | "prism";
 
-/**
- * The game this build's engine drives.
- *
- * Implement all three functions. Nothing else in the project needs changing for
- * the game to run: `src/main.ts` already binds this object to the engine.
- */
+export type Screen =
+  "title" | "howto" | "playing" | "paused" | "levelclear" | "gameover";
+
+export type Phase = "idle" | "swapping" | "resolving";
+
+export type PointerDevice = "mouse" | "pen" | "touch";
+
+export interface CellRef {
+  readonly col: number;
+  readonly row: number;
+}
+
+export interface GemState {
+  readonly col: number;
+  readonly row: number;
+  readonly kind: GemKind | null;
+  readonly cut: Cut;
+  readonly strain: number;
+  readonly fell: number;
+}
+
+export interface BoardState {
+  readonly cols: number;
+  readonly rows: number;
+  readonly cells: readonly GemState[];
+}
+
+export interface RefusalState {
+  readonly a: CellRef;
+  readonly b: CellRef;
+  readonly timer: number;
+}
+
+export interface PointerState {
+  readonly x: number;
+  readonly y: number;
+  readonly down: boolean;
+  readonly device: PointerDevice;
+}
+
+export interface FacetState {
+  readonly screen: Screen;
+  readonly menuIndex: number;
+
+  readonly board: BoardState;
+  readonly phase: Phase;
+  readonly chainStep: number;
+  readonly swapTimer: number;
+  readonly stepTimer: number;
+
+  readonly score: number;
+  readonly level: number;
+  readonly levelScore: number;
+  readonly lastCleared: number;
+  readonly lastPoints: number;
+  readonly lastWaves: number;
+
+  readonly moveScore: number;
+  readonly bestMove: number;
+  readonly bestChain: number;
+
+  readonly selection: CellRef | null;
+  readonly offer: CellRef | null;
+  readonly refusal: RefusalState | null;
+  readonly armedTarget: string | null;
+
+  readonly pointer: PointerState;
+  readonly simTime: number;
+  readonly muted: boolean;
+  readonly refillKinds: readonly string[];
+  readonly arrival?: number;
+  readonly motion?: { readonly a: CellRef; readonly b: CellRef };
+  readonly previous?: readonly GemState[];
+  readonly cleared?: readonly { readonly i: number; readonly wave: number }[];
+  readonly created?: readonly number[];
+  readonly images?: Readonly<Record<string, ImageBitmap>>;
+  readonly systems?: Readonly<Record<string, string>>;
+}
+
+import { debug } from "./debug";
+import { initial, tick } from "./logic";
+import { action, pointer } from "./interaction";
+import { render } from "./render";
+export type FacetDebugApi = typeof debug;
+export const BACKGROUND = "#07121b";
 export const game: Game<FacetState, FacetDebugApi> = {
-  /**
-   * Runs once, before any frame.
-   *
-   * Register every action in ACTIONS against its BINDINGS, load the produced
-   * sprites and particle systems and bind each of the CUES to its produced
-   * file, register the diagnostic sources specs/instrumentation.md lists (each
-   * is handed the state current at the read, so none closes over the state
-   * built here), and build the complete initial state: the title screen over an
-   * idle board, with every field of FacetState set exactly as specs/state.md
-   * states. Return it beside the debug surface.
-   */
-  initialize(_api: InitApi<FacetState>): [FacetState, FacetDebugApi] {
-    throw new Error(NOT_IMPLEMENTED);
+  async initialize(api) {
+    for (const a of C.ACTIONS)
+      api.input.register(a, { keys: [...C.BINDINGS[a]] });
+    const paths = [
+      "board.png",
+      ...C.GEM_KINDS.flatMap((k) => [
+        ...Array.from({ length: 4 }, (_, i) => `gems/${k}-${i}.png`),
+        ...Array.from({ length: 6 }, (_, i) => `gems/break/${k}/${i}.png`),
+      ]),
+      ...Array.from({ length: 4 }, (_, i) => `gems/prism-${i}.png`),
+      ...Array.from({ length: 8 }, (_, i) => `gems/prism-turn/${i}.png`),
+      "gems/brilliant.png",
+      "gems/star.png",
+    ];
+    const images = Object.fromEntries(
+      await Promise.all(
+        paths.map(async (p) => [p, await api.assets.loadImage(p)]),
+      ),
+    );
+    const systems = Object.fromEntries(
+      await Promise.all(
+        ["clear", "flawed", "cut", "aura"].map(async (p) => [
+          p,
+          await (await api.assets.load(`fx/${p}/system.json`)).text(),
+        ]),
+      ),
+    );
+    await Promise.all(
+      Object.values(C.CUES).map((c) =>
+        api.audio.load(c, `audio/${c === C.CUES.clear ? "shatter" : c}.wav`),
+      ),
+    );
+    await Promise.all(
+      [
+        "title",
+        "play",
+        ...Array.from({ length: C.MAX_MULTIPLIER }, (_, i) => `clear-${i + 1}`),
+      ].map((c) => api.audio.load(c, `audio/${c}.wav`)),
+    );
+    for (const key of [
+      "screen",
+      "phase",
+      "score",
+      "level",
+      "levelScore",
+      "chainStep",
+      "lastCleared",
+      "lastPoints",
+      "lastWaves",
+      "bestMove",
+      "bestChain",
+    ] as const)
+      api.diagnostics.register(key, (s) => s[key]);
+    api.diagnostics.register(
+      "board",
+      (s) => `${s.board.cols} × ${s.board.rows}`,
+    );
+    api.diagnostics.register(
+      "pressure",
+      (s) =>
+        `fall ${debug.snapshot(s).lastFall} / ×${Math.min(s.chainStep, C.MAX_MULTIPLIER)}`,
+    );
+    api.diagnostics.register("selection", (s) => JSON.stringify(s.selection));
+    api.diagnostics.register("offer", (s) => JSON.stringify(s.offer));
+    api.diagnostics.register("legal swap", (s) => debug.snapshot(s).legalSwap);
+    api.diagnostics.register(
+      "pointer",
+      (s) =>
+        `${s.pointer.x.toFixed(0)},${s.pointer.y.toFixed(0)} ${s.pointer.device}`,
+    );
+    api.diagnostics.register("target", (s) => s.level * C.LEVEL_TARGET_STEP);
+    return [{ ...initial(), images, systems }, debug];
   },
-
-  /**
-   * Runs once per frame, before `render`: the next state, from the current one.
-   *
-   * `dt` is the real elapsed seconds of this frame, and `simTime` accumulates it
-   * on every update whatever the screen. Read the frame's actions and the
-   * pointer position and edges, drive the menus and the pointer targets, decide
-   * every requested swap by the move rules in specs/rules.md, carry an accepted
-   * swap through SWAP_SECONDS and then a chain forward against each step's own
-   * hold, play cues on their events, and mirror the engine's mute bit into the
-   * returned state's `muted`. The value returned is what `render` draws and what
-   * the next `update` receives; `state` itself is read-only and stays as it was.
-   */
-  update(
-    _state: DeepReadonly<FacetState>,
-    _api: UpdateApi,
-    _dt: number,
-  ): FacetState {
-    throw new Error(NOT_IMPLEMENTED);
+  update(state: DeepReadonly<FacetState>, api, dt) {
+    let s: FacetState = { ...state };
+    const cues = new Set<string>();
+    if (api.input.pressed("mute")) api.audio.setMuted(!api.audio.muted());
+    for (const a of C.ACTIONS)
+      if (a !== "mute" && api.input.pressed(a)) s = action(s, a);
+    for (const sample of api.input.pointerSamples()) {
+      if (!sample.primary) continue;
+      const old = s;
+      const type =
+        sample.type === "down" ? "down" : sample.type === "up" ? "up" : "move";
+      s = pointer(s, type, sample.x, sample.y, sample.device);
+      if (s.phase === "swapping" && old.phase !== "swapping")
+        cues.add(C.CUES.swap);
+      if (s.refusal && s.refusal !== old.refusal) cues.add(C.CUES.refuse);
+      if (
+        s.selection &&
+        JSON.stringify(s.selection) !== JSON.stringify(old.selection)
+      )
+        cues.add(C.CUES.select);
+    }
+    s = tick(s, dt, (c) => cues.add(c));
+    if (s.screen === "playing" && s.arrival !== undefined)
+      s = { ...s, arrival: Math.min(1, s.arrival + dt) };
+    for (const c of cues) {
+      if (c === C.CUES.clear) {
+        api.audio.play(C.CUES.clear);
+        api.audio.play(
+          `clear-${Math.max(1, Math.min(s.chainStep, C.MAX_MULTIPLIER))}`,
+        );
+      } else api.audio.play(c);
+    }
+    const theme =
+      s.screen === "title" || s.screen === "howto" ? "title" : "play";
+    api.audio.stop(theme === "title" ? "play" : "title");
+    api.audio.loop(theme);
+    return {
+      ...s,
+      simTime: state.simTime + dt,
+      pointer: api.input.pointer(),
+      muted: api.audio.muted(),
+    };
   },
-
-  /**
-   * Runs once per frame, after `update`, with the state `update` returned.
-   *
-   * `api.ctx` arrives cleared and already carrying the logical transform, so
-   * draw in 1280x720 coordinates and never read the canvas element's size. Each
-   * cell draws at the center specs/board.md fixes, with the readouts, the screens
-   * and the pointer targets clear of the board's extent. A swap in motion, a
-   * shattering set and a falling gem are each drawn between cells over the spans
-   * specs/rules.md gives them. The state arrives read-only, so the type is what
-   * guarantees that rendering changes nothing.
-   */
-  render(_state: DeepReadonly<FacetState>, _api: RenderApi): void {
-    throw new Error(NOT_IMPLEMENTED);
+  render(s, api) {
+    render(s, api.ctx);
   },
 };
